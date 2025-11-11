@@ -802,6 +802,8 @@ def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:
         extracted_data = structure_text_with_llm(invoice_text, filename)
         # Step 3: Validate Data
         validate_extraction(extracted_data, filename)
+        # Store invoice text for reverse charge detection
+        extracted_data["_invoice_text"] = invoice_text
         # Success! Return the clean, validated data
         return extracted_data
     except Exception as llm_error:
@@ -834,7 +836,8 @@ def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:
                 "customer_vat_id": None,
                 "due_date": None,
                 "extraction_method": "basic_regex_fallback",
-                "extraction_note": f"Full extraction failed. Extracted basic financial data using regex patterns. Original error: {str(llm_error)}"
+                "extraction_note": f"Full extraction failed. Extracted basic financial data using regex patterns. Original error: {str(llm_error)}",
+                "_invoice_text": invoice_text  # Store invoice text for reverse charge detection
             }
         else:
             # Even basic extraction failed - re-raise the original error
@@ -864,6 +867,48 @@ def _split_company_list(raw: str) -> List[str]:
 # ----------------------------------------------------------------------------
 # Mapping & Classification (Modified to fit new pipeline)
 # ----------------------------------------------------------------------------
+
+def _classify_vat_category(vat_percentage: Optional[float], invoice_text: str = "") -> str:
+    """
+    Classifies VAT category based on VAT percentage and invoice text.
+    Returns: "Standard VAT", "Reduced Rate", "Standard Rate (from another country)", 
+             "Zero Rated", "Reverse Charge", or "Unknown"
+    """
+    # Check for reverse charge indicators in text (case-insensitive)
+    if invoice_text:
+        reverse_charge_keywords = [
+            "reverse charge", "btw verlegd", "vat verlegd", "omgekeerde heffing",
+            "reverse charge vat", "rcm", "reverse charge mechanism"
+        ]
+        text_lower = invoice_text.lower()
+        if any(keyword in text_lower for keyword in reverse_charge_keywords):
+            return "Reverse Charge"
+    
+    # If no VAT percentage, return Unknown
+    if vat_percentage is None:
+        return "Unknown"
+    
+    vat_percentage = float(vat_percentage)
+    
+    # Classify based on percentage (with small tolerance for rounding)
+    if abs(vat_percentage - 21.0) < 0.1:
+        return "Standard VAT"
+    elif abs(vat_percentage - 9.0) < 0.1:
+        return "Reduced Rate"
+    elif abs(vat_percentage - 14.0) < 0.1:
+        return "Standard Rate (from another country)"
+    elif abs(vat_percentage - 0.0) < 0.1:
+        return "Zero Rated"
+    else:
+        # For other rates, try to classify
+        if 20.0 <= vat_percentage <= 22.0:
+            return "Standard VAT"
+        elif 8.0 <= vat_percentage <= 10.0:
+            return "Reduced Rate"
+        elif 13.0 <= vat_percentage <= 15.0:
+            return "Standard Rate (from another country)"
+        else:
+            return f"Other ({vat_percentage}%)"
 
 def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -895,6 +940,12 @@ def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any
         if subtotal > 0:
             vat_percentage = round((total_vat / subtotal) * 100, 2)
     
+    # Get invoice text for reverse charge detection
+    invoice_text = llm_data.get("_invoice_text", "")
+    
+    # Classify VAT category
+    vat_category = _classify_vat_category(vat_percentage, invoice_text)
+    
     return {
         "Date": llm_data.get("invoice_date"),
         "Invoice Number": llm_data.get("invoice_number"),
@@ -904,6 +955,7 @@ def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any
         "Nett Amount": llm_data.get("subtotal") or 0.0,
         "VAT Amount": llm_data.get("total_vat") or 0.0,
         "VAT %": vat_percentage,  # Added VAT percentage
+        "VAT Category": vat_category,  # Added VAT category
         "Gross Amount": llm_data.get("total_amount") or 0.0,
         "Currency": llm_data.get("currency") or "EUR",
         "Description": description,
