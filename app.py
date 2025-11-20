@@ -1350,6 +1350,11 @@ async def upload_multiple_and_extract(
 # Local dev entrypoint
 if __name__ == "__main__":
     import uvicorn
-    # logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s") # Moved to top
-    logging.info("Starting uvicorn server at http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Check for PORT environment variable (set by Render/Heroku)
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "127.0.0.1")
+    # If PORT is set (production), use 0.0.0.0 to bind to all interfaces
+    if os.getenv("PORT"):
+        host = "0.0.0.0"
+    logging.info(f"Starting uvicorn server at http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
