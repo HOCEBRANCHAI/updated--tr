@@ -1,5 +1,5 @@
 # processor.py
-# Library of robust extraction, OCR, FX, validation, mapping.
+# Robust extraction, OCR, FX, validation, mapping, and posting.
 # Used by app.py. No server here.
 
 import io
@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import date, timedelta
 
 # Money / math
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import Decimal, ROUND_HALF_UP
 
 # OCR & PDF
 import PyPDF2
@@ -81,9 +81,7 @@ def _prev_business_day(d: date) -> date:
 def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
     """
     Return (rate, rate_date_str) for 1 CCY -> EUR using exchangerate.host (ECB).
-    Strategy:
-      1) Try direct:  base=CCY&symbols=EUR
-      2) Fallback:    base=EUR&symbols=CCY, then invert
+    Try direct (base=CCY&symbols=EUR) and fallback by inversion.
     Look back up to 7 business days.
     """
     ccy = (ccy or "").upper().strip()
@@ -100,7 +98,7 @@ def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
             rate = (js1.get("rates") or {}).get("EUR")
             if r1.status_code == 200 and rate:
                 return q_rate(rate), d.isoformat()
-            log.warning(f"FX miss (direct) {url1} status={r1.status_code} body={str(js1)[:160]}")
+            log.warning(f"FX miss (direct) {url1} status={r1.status_code}")
         except Exception as ex:
             log.warning(f"FX direct failed {url1}: {ex}")
 
@@ -113,7 +111,7 @@ def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
             if r2.status_code == 200 and base_rate and float(base_rate) != 0.0:
                 inv = Decimal("1") / Decimal(str(base_rate))
                 return q_rate(inv), d.isoformat()
-            log.warning(f"FX miss (invert) {url2} status={r2.status_code} body={str(js2)[:160]}")
+            log.warning(f"FX miss (invert) {url2} status={r2.status_code}")
         except Exception as ex2:
             log.warning(f"FX invert failed {url2}: {ex2}")
 
@@ -371,16 +369,6 @@ def validate_extraction(data: dict, filename: str) -> Tuple[date, str, Decimal, 
     except Exception:
         errors.append("Invalid numeric values for subtotal/total_vat/total_amount.")
 
-    lis = data.get("line_items") or []
-    try:
-        li_sum = sum((q_money(li.get("line_total", 0)) for li in lis if li.get("line_total") is not None),
-                     Decimal("0.00"))
-        if lis and not nearly_equal_money(li_sum, sub):
-            # Warn only (telecom/discount patterns often don't sum neatly)
-            log.warning(f"{filename}: line_items sum({li_sum}) != subtotal({sub}). Using header totals.")
-    except Exception:
-        log.warning(f"{filename}: invalid line_items; continuing with header totals.")
-
     if errors:
         msg = f"Validation failed for {filename}: {' | '.join(errors)}"
         log.error(msg)
@@ -398,7 +386,7 @@ def _split_company_list(raw: str) -> List[str]:
     return [p.strip() for p in re.split(r"[,\n;]", raw) if p and p.strip()]
 
 def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
-    vcat = (llm_data.get("vat_category") or "").strip().lower()
+    # look in vat_breakdown
     for v in (llm_data.get("vat_breakdown") or []):
         r = v.get("rate")
         if isinstance(r, (int, float)):
@@ -406,6 +394,8 @@ def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
                 return float(r)
             except Exception:
                 pass
+    # fallback based on category
+    vcat = (llm_data.get("vat_category") or "").strip().lower()
     if vcat in {"reverse-charge", "out-of-scope", "zero-rated"}:
         return 0.0
     return None
@@ -422,11 +412,11 @@ def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any
         "Customer Name": llm_data.get("customer_name"),
         "Type": "Unclassified",
         "VAT Category": llm_data.get("vat_category"),
-        "VAT Rate (%)": _derive_vat_rate_percent(llm_data),   # NEW
+        "VAT %": _derive_vat_rate_percent(llm_data),   # UNIFIED FIELD NAME
         "Nett Amount": float(q_money(llm_data.get("subtotal") or 0.0)),
         "VAT Amount": float(q_money(llm_data.get("total_vat") or 0.0)),
         "Gross Amount": float(q_money(llm_data.get("total_amount") or 0.0)),
-        "Currency": llm_data.get("currency"),
+        "Currency": (llm_data.get("currency") or "EUR"),
         "Description": description,
         "Full_Extraction_Data": llm_data
     }
@@ -437,8 +427,6 @@ def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]
     ours = [_normalize_company_name(x) for x in our_companies_list]
     if any(o and o in c for o in ours): return "Purchase"
     if any(o and o in v for o in ours): return "Sales"
-    if "dutch food solutions" in c or "mohamed soliman" in c: return "Purchase"
-    if "dutch food solutions" in v: return "Sales"
     return "Unclassified"
 
 def _convert_to_eur_fields(entry: dict) -> dict:
@@ -477,7 +465,126 @@ def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:
     invoice_text = get_text_from_pdf(pdf_bytes, filename)
     llm_data = structure_text_with_llm(invoice_text, filename)
     _ = validate_extraction(llm_data, filename)
+    # attach raw text to Full_Extraction_Data for downstream heuristics if needed
+    llm_data["_invoice_text"] = invoice_text[:20000]
     return llm_data
+
+# -------------------- Posting rules (data-driven) --------------------
+# Default COA codes (override per client in DB later)
+DEFAULT_COA = {
+    "AR": "1100",
+    "AP": "2000",
+    "SALES": "4000",
+    "COGS": "5000",
+    "FREIGHT": "5100",
+    "SOFTWARE": "5200",
+    "VAT_PAYABLE": "2100",
+    "VAT_RECOVERABLE": "1400",
+    "CASH": "1000",
+}
+
+# Rule format supports client overrides later (condition + posting)
+DEFAULT_RULES = [
+    # Sales with VAT
+    {
+        "condition": {"Type": "Sales"},
+        "posting": {
+            "dr": [{"account": "AR", "amount": "Gross Amount (EUR)"}],
+            "cr": [
+                {"account": "SALES", "amount": "Nett Amount (EUR)"},
+                {"account": "VAT_PAYABLE", "amount": "VAT Amount (EUR)"},
+            ],
+        },
+    },
+    # Purchase zero-rated (e.g., freight)
+    {
+        "condition": {"Type": "Purchase", "VAT Category": "Zero Rated"},
+        "posting": {
+            "dr": [{"account": "FREIGHT", "amount": "Nett Amount (EUR)"}],
+            "cr": [{"account": "AP", "amount": "Gross Amount (EUR)"}],
+        },
+    },
+    # Example vendor-specific rule (foreign VAT as non-recoverable)
+    {
+        "condition": {"Type": "Unclassified", "Vendor Name_regex": ".*Google Cloud.*"},
+        "posting": {
+            "dr": [{"account": "SOFTWARE", "amount": "Gross Amount (EUR)"}],
+            "cr": [{"account": "AP", "amount": "Gross Amount (EUR)"}],
+        },
+    },
+]
+
+def _match_rule(entry: dict, rules: list) -> Optional[dict]:
+    import re as _re
+    for r in rules:
+        cond = r.get("condition", {})
+        ok = True
+        for k, v in cond.items():
+            if k.endswith("_regex"):
+                field = k[:-6]
+                if not _re.match(str(v), str(entry.get(field, "") or ""), flags=_re.I):
+                    ok = False; break
+            else:
+                if str(entry.get(k, "")).strip() != str(v).strip():
+                    ok = False; break
+        if ok:
+            return r
+    return None
+
+def _amount_field_to_value(entry: dict, field: str) -> float:
+    # Prefer EUR fields if present
+    if "(EUR)" in field:
+        return float(entry.get(field) or 0.0)
+    mapping = {
+        "Nett Amount": "Nett Amount (EUR)",
+        "VAT Amount": "VAT Amount (EUR)",
+        "Gross Amount": "Gross Amount (EUR)",
+    }
+    f = mapping.get(field, field)
+    return float(entry.get(f) if entry.get(f) is not None else entry.get(field, 0.0) or 0.0)
+
+def build_journal_from_entry(entry: dict, coa: dict = None, rules: list = None) -> dict:
+    coa = {**DEFAULT_COA, **(coa or {})}
+    rules = rules or DEFAULT_RULES
+
+    # Guard rails
+    if entry.get("FX Error"):
+        return {"status": "blocked", "reason": "Needs FX", "entry": entry}
+    if not entry.get("Date"):
+        return {"status": "blocked", "reason": "Missing Date", "entry": entry}
+
+    rule = _match_rule(entry, rules)
+    if not rule:
+        return {"status": "blocked", "reason": "Unmapped", "entry": entry}
+
+    lines = []
+    for side in ("dr", "cr"):
+        for post in rule["posting"].get(side, []):
+            acct_key = post["account"]
+            acct = coa.get(acct_key, acct_key)  # allow literal code
+            amt = _amount_field_to_value(entry, post["amount"])
+            lines.append({
+                "account_code": acct,
+                "debit": round(amt, 2) if side == "dr" else 0.0,
+                "credit": round(amt, 2) if side == "cr" else 0.0,
+            })
+
+    d = round(sum(x["debit"] for x in lines), 2)
+    c = round(sum(x["credit"] for x in lines), 2)
+    if d != c:
+        return {"status": "blocked", "reason": f"Imbalance {d} != {c}", "entry": entry, "lines": lines}
+
+    return {
+        "status": "posted",
+        "journal": {
+            "entry_date": entry["Date"],
+            "memo": entry.get("Description") or f"{entry.get('Vendor Name')} / {entry.get('Invoice Number')}",
+            "currency": entry.get("Currency"),
+            "fx_rate": entry.get("FX Rate (ccy->EUR)"),
+            "client_id": entry.get("client_id"),
+            "lines": lines,
+        }
+    }
 
 # -------------------- Public API for app.py --------------------
 __all__ = [
@@ -486,5 +593,8 @@ __all__ = [
     "_classify_type",
     "_split_company_list",
     "_convert_to_eur_fields",
+    "build_journal_from_entry",
+    "DEFAULT_COA",
+    "DEFAULT_RULES",
     "q_money",
 ]
