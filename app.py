@@ -964,6 +964,108 @@ def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+def _is_credit_note(invoice_text: str, invoice_number: str = None) -> bool:
+    """
+    Detects if a document is a credit note by checking for credit note keywords.
+    """
+    if not invoice_text:
+        return False
+    
+    text_lower = invoice_text.lower()
+    invoice_num_lower = (invoice_number or "").lower()
+    
+    # Keywords that indicate a credit note
+    credit_note_keywords = [
+        "credit note",
+        "creditnote",
+        "credit memo",
+        "creditmemo",
+        "creditnota",
+        "credit nota",
+        "nota de credito",
+        "nota de crédito",
+        "avoir",
+        "gutschrift",
+        "nota di credito",
+        "crédit",
+        "cn-",
+        "-cn",
+        "cn:",
+        "credit:"
+    ]
+    
+    # Check if any keyword appears in the text
+    for keyword in credit_note_keywords:
+        if keyword in text_lower or keyword in invoice_num_lower:
+            return True
+    
+    return False
+
+def _apply_credit_note_negative_amounts(register_entry: Dict[str, Any], invoice_text: str = None) -> Dict[str, Any]:
+    """
+    If the document is a credit note, ensures that Nett Amount and Gross Amount are negative.
+    If they already have a negative sign, leaves them unchanged.
+    If they don't have a negative sign, makes them negative.
+    Also makes VAT Amount negative if net and gross are negative.
+    """
+    # Get invoice text from register entry if not provided
+    if not invoice_text:
+        full_data = register_entry.get("Full_Extraction_Data", {})
+        invoice_text = full_data.get("_invoice_text", "")
+    
+    invoice_number = register_entry.get("Invoice Number", "")
+    
+    # Check if this is a credit note
+    if not _is_credit_note(invoice_text, invoice_number):
+        return register_entry
+    
+    # Get current amounts
+    nett_amount = register_entry.get("Nett Amount", 0.0) or 0.0
+    gross_amount = register_entry.get("Gross Amount", 0.0) or 0.0
+    vat_amount = register_entry.get("VAT Amount", 0.0) or 0.0
+    
+    # Convert to float if they're not already
+    try:
+        nett_amount = float(nett_amount)
+        gross_amount = float(gross_amount)
+        vat_amount = float(vat_amount)
+    except (ValueError, TypeError):
+        logging.warning(f"Could not convert amounts to float for credit note: {register_entry.get('Invoice Number')}")
+        return register_entry
+    
+    # Apply negative sign if not already negative
+    if nett_amount > 0:
+        register_entry["Nett Amount"] = -abs(nett_amount)
+        logging.info(f"Applied negative sign to Nett Amount for credit note: {register_entry.get('Invoice Number')}")
+    elif nett_amount == 0:
+        # Keep zero as zero
+        pass
+    else:
+        # Already negative, keep as is
+        logging.info(f"Nett Amount already negative for credit note: {register_entry.get('Invoice Number')}")
+    
+    if gross_amount > 0:
+        register_entry["Gross Amount"] = -abs(gross_amount)
+        logging.info(f"Applied negative sign to Gross Amount for credit note: {register_entry.get('Invoice Number')}")
+    elif gross_amount == 0:
+        # Keep zero as zero
+        pass
+    else:
+        # Already negative, keep as is
+        logging.info(f"Gross Amount already negative for credit note: {register_entry.get('Invoice Number')}")
+    
+    # Make VAT Amount negative if net and gross are negative (or if it's positive)
+    if nett_amount < 0 or gross_amount < 0:
+        if vat_amount > 0:
+            register_entry["VAT Amount"] = -abs(vat_amount)
+            logging.info(f"Applied negative sign to VAT Amount for credit note: {register_entry.get('Invoice Number')}")
+        elif vat_amount == 0:
+            # Keep zero as zero
+            pass
+        # If already negative, keep as is
+    
+    return register_entry
+
 def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]) -> str:
     """
     (Your original function - no changes needed)
@@ -1055,10 +1157,14 @@ async def upload_and_extract(
         # 2. Map to register format
         register_entry = _map_llm_output_to_register_entry(llm_data)
         
-        # 3. Classify
+        # 3. Apply credit note negative amounts logic
+        invoice_text = llm_data.get("_invoice_text", "")
+        register_entry = _apply_credit_note_negative_amounts(register_entry, invoice_text)
+        
+        # 4. Classify
         register_entry["Type"] = _classify_type(register_entry, our_companies_list)
         
-        # 4. Apply currency conversion
+        # 5. Apply currency conversion
         register_entry = _convert_to_eur_fields(register_entry, conversion_enabled)
         
         # 5. Add conversion info to Full_Extraction_Data for audit trace
@@ -1138,10 +1244,14 @@ async def upload_multiple_and_extract(
                 # 2. Map to register format
                 register_entry = _map_llm_output_to_register_entry(llm_data)
                 
-                # 3. Classify
+                # 3. Apply credit note negative amounts logic
+                invoice_text = llm_data.get("_invoice_text", "")
+                register_entry = _apply_credit_note_negative_amounts(register_entry, invoice_text)
+                
+                # 4. Classify
                 register_entry["Type"] = _classify_type(register_entry, our_companies_list)
                 
-                # 4. Apply currency conversion
+                # 5. Apply currency conversion
                 register_entry = _convert_to_eur_fields(register_entry, conversion_enabled)
                 
                 # 5. Add conversion info to Full_Extraction_Data for audit trace
